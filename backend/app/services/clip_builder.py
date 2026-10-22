@@ -1,0 +1,496 @@
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Optional, Set, Tuple
+from loguru import logger
+
+import cv2
+
+from backend.app.config import settings
+
+
+@dataclass
+class BuiltClip:
+    camera_id: int
+    path: str
+    url: str
+    frame_count: int
+    fps: float
+    width: int
+    height: int
+
+
+_TS_PATTERNS = [
+    # Example: 2025-10-23T20-56-25-468181.jpg (from code that replaces : and . with -)
+    re.compile(r"(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})T(?P<H>\d{2})-(?P<M>\d{2})-(?P<S>\d{2})(?:-(?P<us>\d+))?"),
+    # Fallback: plain ISO-like without changes: 2025-10-23T20:56:25(.468181)?
+    re.compile(r"(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})T(?P<H>\d{2}):(?P<M>\d{2}):(?P<S>\d{2})(?:\.(?P<us>\d+))?"),
+]
+
+
+def _parse_ts_from_filename(name: str) -> Optional[datetime]:
+    stem = Path(name).stem
+    for pat in _TS_PATTERNS:
+        m = pat.search(stem)
+        if m:
+            try:
+                us = int(m.group("us")) if m.groupdict().get("us") else 0
+                return datetime(
+                    int(m.group("y")),
+                    int(m.group("m")),
+                    int(m.group("d")),
+                    int(m.group("H")),
+                    int(m.group("M")),
+                    int(m.group("S")),
+                    us,
+                )
+            except Exception:
+                continue
+    return None
+
+
+def _collect_snapshots(
+    camera_id: int,
+    start_dt: datetime,
+    end_dt: datetime,
+    allowed_timestamps: Optional[List[str]] = None,
+    whitelist_dts: Optional[Set[datetime]] = None,
+    whitelist_tolerance_sec: float = 5.0,
+) -> List[Tuple[datetime, Path]]:
+    cam_dir = settings.SNAPSHOTS_DIR / f"camera_{camera_id}"
+    if not cam_dir.exists():
+        return []
+    files: List[Tuple[datetime, Path]] = []
+    
+    parsed_whitelist = whitelist_dts
+    if parsed_whitelist is None and allowed_timestamps:
+        parsed_whitelist = _parse_whitelist(allowed_timestamps)
+
+    for p in cam_dir.glob("*.jpg"):
+        ts = _parse_ts_from_filename(p.name)
+        if ts is None:
+            # fall back to file mtime if parsing fails
+            try:
+                ts = datetime.fromtimestamp(p.stat().st_mtime)
+            except Exception:
+                continue
+        if start_dt <= ts <= end_dt:
+            # If whitelist is provided, only include snapshots near a whitelisted timestamp
+            if parsed_whitelist is not None:
+                if not any(abs((ts - wt).total_seconds()) <= whitelist_tolerance_sec for wt in parsed_whitelist):
+                    continue
+            files.append((ts, p))
+    files.sort(key=lambda x: x[0])
+    return files
+
+
+def _parse_whitelist(stamps: List[str]) -> Set[datetime]:
+    out = set()
+    for s in stamps:
+        try:
+            # Handle possible variations in ISO format
+            # Replace Z with +00:00 to handle UTC explicitly
+            safe = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(safe)
+            if dt.tzinfo is not None:
+                # Convert to UTC and strip timezone info to match naive file timestamps (which are UTC)
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            out.add(dt)
+        except Exception:
+            pass
+    return out
+
+
+def _is_mp4_readable(path: Path) -> bool:
+    """Quick check that an MP4 file has a valid moov atom and can be opened."""
+    try:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return False
+        # Try to read at least one frame to confirm usability
+        ok = cap.grab()
+        cap.release()
+        return ok
+    except Exception:
+        return False
+
+
+def _collect_recordings(
+    camera_id: int,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> List[Tuple[datetime, datetime, Path]]:
+    cam_dir = settings.RECORDINGS_DIR / f"camera_{camera_id}"
+    if not cam_dir.exists():
+        return []
+    
+    files: List[Tuple[datetime, Path]] = []
+    
+    for p in cam_dir.glob("*.mp4"):
+        # Skip temporary files from FFmpeg background conversion
+        if p.stem.endswith("_h264") or p.stem.endswith("._converting"):
+            continue
+        ts = _parse_ts_from_filename(p.name)
+        if ts is None:
+            try:
+                ts = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+            except Exception:
+                continue
+        files.append((ts, p))
+        
+    files.sort(key=lambda x: x[0])
+    
+    overlapping = []
+    for i in range(len(files)):
+        chunk_start, p = files[i]
+        
+        if i + 1 < len(files):
+            chunk_end = files[i+1][0]
+        else:
+            try:
+                chunk_end = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+            except Exception:
+                chunk_end = datetime.now(timezone.utc).replace(tzinfo=None)
+                
+        if chunk_end < chunk_start:
+            chunk_end = chunk_start + timedelta(seconds=300)
+
+        if start_dt <= chunk_end and end_dt >= chunk_start:
+            if _is_mp4_readable(p):
+                overlapping.append((chunk_start, chunk_end, p))
+            else:
+                logger.debug("Skipping unreadable/incomplete recording: {}", p.name)
+            
+    return overlapping
+
+
+def _build_clip_from_snapshots_fallback(
+    camera_id: int,
+    start_iso: str,
+    end_iso: str,
+    fps: float = 5.0,
+    allowed_timestamps: Optional[List[str]] = None,
+) -> BuiltClip:
+    """
+    Build an MP4 clip by stitching snapshots between [start_iso, end_iso] for a camera.
+    Returns BuiltClip with filesystem path and public URL.
+    """
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt = datetime.fromisoformat(end_iso)
+        if start_dt.tzinfo is not None:
+            start_dt = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        if end_dt.tzinfo is not None:
+            end_dt = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception as e:
+        raise ValueError(f"Invalid start/end ISO timestamps: {e}")
+
+    if end_dt < start_dt:
+        raise ValueError("end must be >= start")
+
+    items = _collect_snapshots(
+        camera_id,
+        start_dt,
+        end_dt,
+        whitelist_dts=_parse_whitelist(allowed_timestamps) if allowed_timestamps else None,
+    )
+    if not items:
+        raise FileNotFoundError("No snapshots found in the requested interval")
+
+    # Read first frame to get frame size
+    first_img = cv2.imread(str(items[0][1]))
+    if first_img is None:
+        raise RuntimeError(f"Failed to read first snapshot: {items[0][1]}")
+    height, width = first_img.shape[:2]
+
+    # Prepare output path
+    out_dir: Path = settings.CLIPS_DIR / f"camera_{camera_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_start = start_iso.replace(":", "-").replace(".", "-")
+    safe_end = end_iso.replace(":", "-").replace(".", "-")
+    base_name = f"{safe_start}__to__{safe_end}"
+    writer = None
+    out_path = None
+
+    # Initialize writer with browser-compatible codec
+    _fourcc_fn = getattr(cv2, "VideoWriter_fourcc", None)
+    if _fourcc_fn is None:
+        raise RuntimeError("OpenCV build missing VideoWriter_fourcc")
+
+    # Use MP4V codec which has universal browser support
+    # MP4V (MPEG-4 Part 2) works in all major browsers and doesn't require external libraries
+    candidates = [
+        ("mp4", "mp4v"),  # MPEG-4 Part 2 - universal browser support
+        ("mp4", "XVID"),  # Xvid fallback
+        ("avi", "MJPG"),  # Last resort
+    ]
+
+    # Ensure even dimensions for codec compatibility
+    width = width - (width % 2) if width % 2 != 0 else width
+    height = height - (height % 2) if height % 2 != 0 else height
+
+    target_size = (width, height)
+    for ext, codec in candidates:
+        # Only adjust dimensions if needed (MJPEG doesn't require even dimensions)
+        target_size = (width, height)
+
+        fourcc = _fourcc_fn(*codec)
+        test_path = out_dir / f"{base_name}.{ext}"
+        wtr = cv2.VideoWriter(str(test_path), fourcc, max(0.5, float(fps)), target_size)
+        if wtr is not None and wtr.isOpened():
+            writer = wtr
+            out_path = test_path
+            width, height = target_size
+            break
+
+    if writer is None or out_path is None:
+        raise RuntimeError("Failed to open VideoWriter with any supported codec")
+
+    frame_count = 0
+    try:
+        for ts, img_path in items:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                # skip unreadable frames
+                continue
+            if img.shape[1] != width or img.shape[0] != height:
+                img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+            writer.write(img)
+            frame_count += 1
+    finally:
+        writer.release()
+
+    if frame_count == 0:
+        # Cleanup empty file
+        try:
+            out_path.unlink(missing_ok=True)  # type: ignore
+        except Exception:
+            pass
+        raise RuntimeError("No valid frames written to clip")
+
+    # ==========================================
+    # CRITICAL: Convert to H.264 using FFmpeg
+    # ==========================================
+    # OpenCV's codecs don't work reliably in browsers.
+    # Use imageio-ffmpeg (bundles FFmpeg) to convert to H.264.
+    final_path = out_path
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        import subprocess
+        
+        # Get bundled ffmpeg executable
+        ffmpeg_exe = get_ffmpeg_exe()
+        
+        # Create H.264 output path (use ._converting suffix to avoid being picked up by _collect_recordings)
+        h264_path = out_path.parent / f"{out_path.stem}._converting.mp4"
+        
+        # FFmpeg command for browser-compatible H.264
+        cmd = [
+            ffmpeg_exe,
+            "-y",  # overwrite
+            "-i", str(out_path),  # input
+            "-c:v", "libx264",  # H.264 codec
+            "-preset", "fast",  # encoding speed
+            "-crf", "23",  # quality
+            "-pix_fmt", "yuv420p",  # browser compatibility
+            "-movflags", "+faststart",  # web optimization
+            "-loglevel", "error",  # suppress verbose output
+            str(h264_path)
+        ]
+        
+        # Run FFmpeg conversion
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60
+            )
+            success = result.returncode == 0 and h264_path.exists()
+            err_msg = result.stderr.decode()[:200] if result.stderr else "Unknown error"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            logger.error("FFmpeg conversion failed: {}", e)
+            result = None
+            success = False
+            err_msg = str(e)
+            
+        if success:
+            # Success! Replace original with H.264 version
+            if h264_path != out_path:
+                try:
+                    out_path.unlink()  # Delete original
+                except Exception:
+                    pass
+                # Rename H.264 to original name
+                final_out_path = out_path.parent / f"{base_name}.mp4"
+                h264_path.rename(final_out_path)
+                final_path = final_out_path
+            else:
+                final_path = h264_path
+            logger.info("Converted snapshot clip to H.264 via FFmpeg: {}", final_path.name)
+        else:
+            logger.warning("FFmpeg snapshot-fallback conversion failed: {}", err_msg)
+            final_path = out_path
+            
+    except ImportError:
+        logger.warning("imageio-ffmpeg not installed — snapshot fallback clip uses mp4v codec (may not play in browsers). Install: pip install imageio-ffmpeg")
+        final_path = out_path
+    except Exception as e:
+        logger.warning("FFmpeg snapshot-fallback conversion error: {}. Using original video.", e)
+        final_path = out_path
+
+    # Public URL (served by static /media/clips)
+    rel = final_path.relative_to(settings.CLIPS_DIR).as_posix()
+    url = f"/media/clips/{rel}"
+    return BuiltClip(
+        camera_id=camera_id,
+        path=str(final_path),
+        url=url,
+        frame_count=frame_count,
+        fps=fps,
+        width=width,
+        height=height,
+    )
+
+
+def build_clip_from_snapshots(
+    camera_id: int,
+    start_iso: str,
+    end_iso: str,
+    fps: float = 5.0,
+    allowed_timestamps: Optional[List[str]] = None,
+) -> BuiltClip:
+    """
+    Build an MP4 clip by extracting from continuous recordings between [start_iso, end_iso].
+    Returns BuiltClip with filesystem path and public URL.
+    Note: kept the name `build_clip_from_snapshots` for backwards compatibility with callers.
+    """
+    try:
+        start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        if start_dt.tzinfo is not None:
+            start_dt = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        if end_dt.tzinfo is not None:
+            end_dt = end_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception as e:
+        raise ValueError(f"Invalid start/end ISO timestamps: {e}")
+
+    if end_dt < start_dt:
+        raise ValueError("end must be >= start")
+
+    items = _collect_recordings(camera_id, start_dt, end_dt)
+    if not items:
+        # Fallback to old behavior if no recordings exist
+        return _build_clip_from_snapshots_fallback(camera_id, start_iso, end_iso, fps, allowed_timestamps)
+        
+    out_dir: Path = settings.CLIPS_DIR / f"camera_{camera_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_start = start_iso.replace(":", "-").replace(".", "-")
+    safe_end = end_iso.replace(":", "-").replace(".", "-")
+    base_name = f"{safe_start}__to__{safe_end}"
+    out_path = out_dir / f"{base_name}.mp4"
+    
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        ffmpeg_exe = get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = "ffmpeg"
+        
+    import subprocess
+    
+    if len(items) == 1:
+        # Single file
+        chunk_start, chunk_end, p = items[0]
+        offset_sec = max(0.0, (start_dt - chunk_start).total_seconds())
+        duration_sec = (end_dt - start_dt).total_seconds()
+        
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-ss", str(offset_sec),
+            "-i", str(p),
+            "-t", str(duration_sec),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-loglevel", "error", str(out_path)
+        ]
+        try:
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            logger.error("build_clip_from_snapshots: ffmpeg trim failed (cmd={}): {}", cmd, exc)
+            out_path.unlink(missing_ok=True)
+            return _build_clip_from_snapshots_fallback(camera_id, start_iso, end_iso, fps, allowed_timestamps)
+        if cp.returncode != 0:
+            err = cp.stderr.decode(errors="ignore") if cp.stderr else ""
+            logger.error("build_clip_from_snapshots: ffmpeg trim failed (cmd={}): {}", cmd, err[:500])
+            out_path.unlink(missing_ok=True)
+            return _build_clip_from_snapshots_fallback(camera_id, start_iso, end_iso, fps, allowed_timestamps)
+    else:
+        # Merge via concat demuxer
+        concat_file = out_dir / f"{base_name}_concat.txt"
+        with concat_file.open("w") as f:
+            for _, _, p in items:
+                # ffmpeg requires full paths properly formatted for concat
+                f.write(f"file '{p.resolve().as_posix()}'\n")
+                
+        overall_start = items[0][0]
+        offset_sec = max(0.0, (start_dt - overall_start).total_seconds())
+        duration_sec = (end_dt - start_dt).total_seconds()
+        
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_file),
+            "-ss", str(offset_sec),
+            "-t", str(duration_sec),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-loglevel", "error", str(out_path)
+        ]
+        try:
+            try:
+                cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+                logger.error("build_clip_from_snapshots: ffmpeg concat failed (cmd={}): {}", cmd, exc)
+                out_path.unlink(missing_ok=True)
+                return _build_clip_from_snapshots_fallback(camera_id, start_iso, end_iso, fps, allowed_timestamps)
+            if cp.returncode != 0:
+                err = cp.stderr.decode(errors="ignore") if cp.stderr else ""
+                logger.error("build_clip_from_snapshots: ffmpeg concat failed (cmd={}): {}", cmd, err[:500])
+                out_path.unlink(missing_ok=True)
+                return _build_clip_from_snapshots_fallback(camera_id, start_iso, end_iso, fps, allowed_timestamps)
+        finally:
+            try:
+                concat_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            
+    if not out_path.exists():
+        # Fallback to snaps if ffmpeg fails
+        return _build_clip_from_snapshots_fallback(camera_id, start_iso, end_iso, fps, allowed_timestamps)
+        
+    rel = out_path.relative_to(settings.CLIPS_DIR).as_posix()
+    url = f"/media/clips/{rel}"
+    
+    # Try to grab frame count/width/height (approx)
+    try:
+        cap = cv2.VideoCapture(str(out_path))
+        fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        cap.release()
+    except Exception:
+        fc, w, h = 0, 640, 480
+    
+    return BuiltClip(
+        camera_id=camera_id,
+        path=str(out_path),
+        url=url,
+        frame_count=fc,
+        fps=fps,
+        width=w,
+        height=h,
+    )

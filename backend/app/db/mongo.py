@@ -1,0 +1,133 @@
+from loguru import logger
+from typing import Any, Dict
+from pymongo import MongoClient, ASCENDING, DESCENDING, TEXT
+from pymongo.collection import Collection
+from pymongo.database import Database
+
+from backend.app.config import settings
+
+# Short server-selection timeout keeps imports/offline evaluation usable when
+# the local MongoDB daemon is not running.  The previous default (20-30 s) made
+# ``import backend.app.db.mongo`` look like a hang.
+client: MongoClient = MongoClient(
+    settings.MONGODB_URI,
+    serverSelectionTimeoutMS=settings.MONGO_SERVER_SELECTION_TIMEOUT_MS,
+    connectTimeoutMS=settings.MONGO_SERVER_SELECTION_TIMEOUT_MS,
+    socketTimeoutMS=max(2000, settings.MONGO_SERVER_SELECTION_TIMEOUT_MS * 2),
+)
+db: Database = client[settings.MONGO_DB_NAME]
+
+# Collections
+cameras: Collection = db["cameras"]
+zones: Collection = db["zones"]  # ROIs per camera for crowd/zone-level counts
+detections: Collection = db["detections"]
+tracks: Collection = db["tracks"]
+events: Collection = db["events"]
+alerts: Collection = db["alerts"]
+alert_logs: Collection = db["alert_logs"]
+chat_messages: Collection = db["chat_messages"]
+videos: Collection = db["videos"]  # optional manifest of recording segments
+vlm_frames: Collection = db["vlm_frames"]  # semantic frame-level metadata (FAISS stores vectors)
+app_settings: Collection = db["settings"]  # app-level settings (e.g., indexing mode)
+anomaly_events: Collection = db["anomaly_events"]  # cached daily anomaly detection results
+
+
+def init_indexes() -> None:
+    # Probe once with the configured short timeout before issuing DDL.  This
+    # prevents a down database from blocking module import for 30 s.
+    client.admin.command("ping")
+    # cameras
+    cameras.create_index([("camera_id", ASCENDING)], unique=True)
+    # zones: ROIs per camera (bbox in normalized [0,1] coords)
+    try:
+        zones.create_index([("camera_id", ASCENDING), ("zone_id", ASCENDING)], unique=True)
+    except Exception:
+        pass
+    # app settings
+    try:
+        app_settings.create_index([("key", ASCENDING)], unique=True)
+    except Exception:
+        pass
+
+    # detections: frequent queries by time/object/color
+    detections.create_index([("camera_id", ASCENDING), ("timestamp", DESCENDING)])
+    detections.create_index(
+        [("objects.object_name", ASCENDING), ("objects.color", ASCENDING), ("timestamp", DESCENDING)]
+    )
+    try:
+        detections.create_index([("person_count", ASCENDING), ("timestamp", DESCENDING)])
+    except Exception:
+        pass
+
+    # tracks: per-camera persistent trackers (from BoT-SORT)
+    try:
+        tracks.create_index([("camera_id", ASCENDING), ("track_id", ASCENDING)], unique=True)
+        tracks.create_index([("last_seen", DESCENDING)])
+        tracks.create_index([("first_seen", DESCENDING)])
+    except Exception:
+        pass
+
+    # events: time-based queries, summary search
+    events.create_index([("camera_id", ASCENDING), ("start_ts", DESCENDING)])
+    try:
+        events.create_index([("summary", TEXT)])
+    except Exception:
+        # Text index may already exist or not supported by deployment tier
+        pass
+
+    # alerts
+    alerts.create_index([("enabled", ASCENDING)])
+    alerts.create_index([("rule.cameras", ASCENDING)])
+
+    # alert logs
+    alert_logs.create_index([("alert_id", ASCENDING), ("triggered_at", DESCENDING)])
+    alert_logs.create_index([("camera_id", ASCENDING), ("triggered_at", DESCENDING)])
+
+    # chat messages
+    chat_messages.create_index([("session_id", ASCENDING), ("created_at", ASCENDING)])
+
+    # videos (recording segments manifest)
+    videos.create_index([("camera_id", ASCENDING), ("start_ts", DESCENDING)])
+
+    # vlm_frames: semantic search metadata (FAISS holds vectors)
+    try:
+        vlm_frames.create_index([("clip_path", ASCENDING), ("frame_index", ASCENDING)], unique=True)
+        vlm_frames.create_index([("camera_id", ASCENDING), ("frame_ts", DESCENDING)])
+        vlm_frames.create_index([("hash", ASCENDING)])
+        vlm_frames.create_index([("model", ASCENDING)])
+    except Exception:
+        pass
+
+    # anomaly_events: daily anomaly detection cache
+    # Compound unique index matches the upsert filter in _cache_result
+    try:
+        # Drop the old single-field index if it exists to avoid conflicts
+        try:
+            anomaly_events.drop_index("date_1")
+        except Exception:
+            pass
+        anomaly_events.create_index(
+            [("date", ASCENDING), ("baseline_days", ASCENDING), ("z_threshold", ASCENDING)],
+            unique=True,
+        )
+    except Exception:
+        pass
+
+
+def get_db_info() -> Dict[str, Any]:
+    return {
+        "name": settings.MONGO_DB_NAME,
+        "collections": sorted(db.list_collection_names()),
+    }
+
+
+# Initialize indexes when module is imported.  Failure is non-fatal; callers
+# that need the database will surface a normal pymongo error on first use.
+try:
+    init_indexes()
+except Exception as e:
+    logger.warning(
+        "MongoDB unavailable at import time ({}); starting without indexes. "
+        "Set MONGODB_URI to a reachable instance for database-backed features.",
+        type(e).__name__,
+    )

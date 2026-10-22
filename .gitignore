@@ -1,0 +1,52 @@
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Regenerable LLM parse caches
+backend/benchmarks/parsed_cache/*.json
+backend/benchmarks/parser_cache/*.json
+
+# Model weights, indexes and recordings (not shipped)
+*.pt
+*.pth
+*.onnx
+*.bin
+data/recordings/
+data/clips/
+data/snapshots/
+data/logs/
+intel/
+backend/intel/
+
+# ...except the shipped FAISS indices + metadata, which stay tracked
+!data/index/
+!data/index/**
+
+# Frontend build output
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Logs and scratch
+*.log
+logs/
+*.tmp
+*.bak
+*~
+
+# OS / editors
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
